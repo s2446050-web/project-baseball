@@ -9,4 +9,3 @@ streamlit
 opencv-python-headless
 numpy
 streamlit-webrtc
-av
