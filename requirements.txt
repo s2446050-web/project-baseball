@@ -1,0 +1,12 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Mon Dec 15 14:00:15 2025
+
+@author: makik
+"""
+
+streamlit
+opencv-python-headless
+numpy
+streamlit-webrtc
+av
