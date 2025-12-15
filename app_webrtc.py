@@ -5,11 +5,12 @@ import tempfile
 import av
 import math
 import random
+import os
 from collections import deque, defaultdict
 from streamlit_webrtc import webrtc_streamer, WebRtcMode
 
 # ==========================================
-# 1. 解析用ロジック (ここは変更なし)
+# 1. 解析用ロジック
 # ==========================================
 class CentroidTracker:
     def __init__(self, maxDisappeared=5, maxDistance=100):
@@ -60,7 +61,8 @@ def random_color(seed):
 
 class BallTracker:
     def __init__(self):
-        self.fgbg = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=50, detectShadows=False)
+        # MOG2設定
+        self.fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=False)
         self.tracker = CentroidTracker(maxDisappeared=5, maxDistance=100)
         self.trails = defaultdict(lambda: deque(maxlen=64))
         self.colors = dict()
@@ -77,9 +79,9 @@ class BallTracker:
             cnts, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             detections = []
             for c in cnts:
-                if cv2.contourArea(c) < 100: continue
+                if cv2.contourArea(c) < 50: continue # 小さいボールも検知
                 (x,y), radius = cv2.minEnclosingCircle(c)
-                if radius < 3: continue
+                if radius < 2: continue
                 M = cv2.moments(c)
                 if M["m00"] == 0: continue
                 cx, cy = int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
@@ -97,6 +99,9 @@ class BallTracker:
                 if oid not in active_ids: self.trails[oid].appendleft(None)
 
             vis = frame.copy()
+            
+            # 軌道の描画
+            drawn = False
             for oid, trail in self.trails.items():
                 col = self.colors.get(oid, (255,255,255))
                 prev = None
@@ -106,17 +111,29 @@ class BallTracker:
                     if prev is not None:
                         thickness = int(np.sqrt(64 / float(i+1)) * 2)
                         cv2.line(vis, prev, pt, col, thickness)
+                        drawn = True
                     prev = pt
                 if len(trail) > 0 and trail[0] is not None:
                     cv2.circle(vis, (int(trail[0][0]), int(trail[0][1])), 5, col, -1)
+            
+            # ★デバッグ表示: 解析が動いているか画面左上に表示
+            if not drawn:
+                cv2.putText(vis, "Scanning...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                cv2.putText(vis, "TRACKING!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
             return vis
+
         except Exception as e:
+            # ★エラーが起きたら、隠さずに画面に赤文字で書き込む
+            err_msg = f"Error: {str(e)}"
+            cv2.putText(frame, err_msg, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            print(f"Processing Error: {e}") # ログにも残す
             return frame
 
 # ==========================================
-# 2. WebRTC用プロセッサ (ここを最新版に変更)
+# 2. WebRTC設定
 # ==========================================
-# 通信設定（Google STUNサーバー）
 RTC_CONFIGURATION = {
     "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
 }
@@ -126,13 +143,8 @@ class VideoProcessor:
         self.tracker = BallTracker()
 
     def recv(self, frame):
-        # 最新版では transform ではなく recv を使います
         img = frame.to_ndarray(format="bgr24")
-        
-        # 解析実行
         result_img = self.tracker.process_frame(img)
-        
-        # 変換して戻す
         return av.VideoFrame.from_ndarray(result_img, format="bgr24")
 
 # ==========================================
@@ -145,26 +157,13 @@ def main():
     mode = st.sidebar.radio("モード選択", ("Webカメラ (リアルタイム)", "動画ファイルアップロード"))
 
     if mode == "Webカメラ (リアルタイム)":
-        st.info("【使い方】「START」を押してカメラを許可してください。スマホの場合は「SELECT DEVICE」でカメラを切り替えられます。")
+        st.info("カメラを起動し、映像の左上に文字（Scanning... または Error）が出るか確認してください。")
         
         col1, col2 = st.columns(2)
-        
         with col1:
             st.subheader("Camera 1")
             webrtc_streamer(
                 key="cam1",
-                mode=WebRtcMode.SENDRECV,
-                video_processor_factory=VideoProcessor,  # クラスを指定
-                media_stream_constraints={"video": True, "audio": False},
-                async_processing=True,
-                rtc_configuration=RTC_CONFIGURATION,
-            )
-
-        with col2:
-            st.subheader("Camera 2")
-            st.caption("※スマホでは2台同時起動できない場合があります")
-            webrtc_streamer(
-                key="cam2",
                 mode=WebRtcMode.SENDRECV,
                 video_processor_factory=VideoProcessor,
                 media_stream_constraints={"video": True, "audio": False},
@@ -181,6 +180,7 @@ def main():
             tracker1 = BallTracker()
             tracker2 = BallTracker()
             
+            # 一時ファイル
             tpath1 = tpath2 = None
             if file1:
                 tfile1 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
@@ -195,38 +195,52 @@ def main():
             col1, col2 = st.columns(2)
             ph1 = col1.empty(); ph2 = col2.empty()
             
+            # 保存設定 (修正: avc1 -> mp4v に戻す)
             output_path = "cloud_result.mp4"
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
             target_w, target_h = 640, 480
             final_w = target_w * 2 if (cap1 and cap2) else target_w
             writer = cv2.VideoWriter(output_path, fourcc, 30.0, (final_w, target_h))
+
+            st.text("解析中...")
 
             while True:
                 ret1, frame1 = cap1.read() if cap1 and cap1.isOpened() else (False, None)
                 ret2, frame2 = cap2.read() if cap2 and cap2.isOpened() else (False, None)
                 if not ret1 and not ret2: break
                 
+                # リサイズ
                 if ret1: frame1 = cv2.resize(frame1, (target_w, target_h))
                 if ret2: frame2 = cv2.resize(frame2, (target_w, target_h))
                 
+                # 解析
                 out1 = tracker1.process_frame(frame1) if ret1 else None
                 out2 = tracker2.process_frame(frame2) if ret2 else None
 
+                # 表示更新
                 if out1 is not None: ph1.image(cv2.cvtColor(out1, cv2.COLOR_BGR2RGB))
                 if out2 is not None: ph2.image(cv2.cvtColor(out2, cv2.COLOR_BGR2RGB))
 
+                # 保存
                 final_frame = None
                 if out1 is not None and out2 is not None: final_frame = np.hstack((out1, out2))
                 elif out1 is not None: final_frame = out1
                 elif out2 is not None: final_frame = out2
-                if writer is not None and final_frame is not None: writer.write(final_frame)
+                
+                if writer is not None and final_frame is not None:
+                    writer.write(final_frame)
 
             if cap1: cap1.release()
             if cap2: cap2.release()
             writer.release()
-            st.success("解析完了")
-            with open(output_path, "rb") as f:
-                st.download_button("📥 動画をダウンロード", f, "result.mp4", "video/mp4")
+            
+            # ファイル生成チェック
+            if os.path.exists(output_path):
+                st.success("解析完了")
+                with open(output_path, "rb") as f:
+                    st.download_button("📥 動画をダウンロード", f, "result.mp4", "video/mp4")
+            else:
+                st.error("動画の保存に失敗しました。")
 
 if __name__ == "__main__":
     main()
